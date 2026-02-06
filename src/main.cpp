@@ -25,6 +25,15 @@ struct Sensor {
   unsigned long lastUpdate = 0;
   uint32_t packetCount = 0;
   int rssi = -127;
+  uint8_t lastAckCmd = 0;
+  uint8_t lastAckStatus = 0;
+  unsigned long lastAckMs = 0;
+  uint32_t cfgInterval = 0;
+  uint8_t cfgRetry = 0;
+  uint8_t cfgTx = 0;
+  bool cfgOta = false;
+  uint32_t cfgIp = 0;
+  unsigned long lastStatusMs = 0;
 
   float tempHistory[HISTORY] = {0};
   float humHistory[HISTORY] = {0};
@@ -42,6 +51,15 @@ struct DiscoveredSensor {
   float hum = NAN;
   unsigned long lastSeen = 0;
   int rssi = -127;
+  uint8_t lastAckCmd = 0;
+  uint8_t lastAckStatus = 0;
+  unsigned long lastAckMs = 0;
+  uint32_t cfgInterval = 0;
+  uint8_t cfgRetry = 0;
+  uint8_t cfgTx = 0;
+  bool cfgOta = false;
+  uint32_t cfgIp = 0;
+  unsigned long lastStatusMs = 0;
 };
 
 DiscoveredSensor discovered[MAX_DISCOVERED];
@@ -284,10 +302,122 @@ typedef struct {
   float hum;
 } SensorPacketWithMac;
 
+typedef struct {
+  uint8_t type;
+  uint8_t cmd;
+  uint16_t reserved;
+  uint32_t value;
+} SensorCmdPacket;
+
+typedef struct {
+  uint8_t type;
+  uint8_t cmd;
+  char value[64];
+} SensorCmdStrPacket;
+
+typedef struct {
+  uint8_t type;
+  uint8_t cmd;
+  uint8_t status;
+  uint8_t reserved;
+  uint32_t value;
+} SensorAckPacket;
+
+typedef struct {
+  uint8_t type;
+  uint8_t ota;
+  uint8_t retry;
+  uint8_t tx;
+  uint32_t interval;
+  uint32_t ip;
+} SensorStatusPacket;
+
+enum {
+  CMD_SET_INTERVAL = 1,
+  CMD_SET_RETRY = 2,
+  CMD_SET_TXPOWER = 3,
+  CMD_SET_OTA = 4,
+  CMD_SET_WIFI_SSID = 5,
+  CMD_SET_WIFI_PASS = 6,
+  MSG_TYPE_CMD = 2,
+  MSG_TYPE_ACK = 3,
+  MSG_TYPE_STATUS = 4
+};
+
+bool parseMacString(const String& mac, uint8_t out[6]) {
+  int values[6];
+  if (sscanf(mac.c_str(), "%x:%x:%x:%x:%x:%x",
+             &values[0], &values[1], &values[2],
+             &values[3], &values[4], &values[5]) != 6) {
+    return false;
+  }
+  for (int i = 0; i < 6; i++) out[i] = (uint8_t) values[i];
+  return true;
+}
+
+bool ensurePeer(const uint8_t* mac) {
+  if (esp_now_is_peer_exist(mac)) return true;
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, mac, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  return esp_now_add_peer(&peerInfo) == ESP_OK;
+}
+
+bool sendSensorCmdStr(const String& macStr, uint8_t cmd, const String& value) {
+  uint8_t mac[6];
+  if (!parseMacString(macStr, mac)) return false;
+  if (!ensurePeer(mac)) return false;
+  SensorCmdStrPacket pkt = {};
+  pkt.type = MSG_TYPE_CMD;
+  pkt.cmd = cmd;
+  value.toCharArray(pkt.value, sizeof(pkt.value));
+  return esp_now_send(mac, (uint8_t*)&pkt, sizeof(pkt)) == ESP_OK;
+}
+
+bool sendSensorCmd(const String& macStr, uint8_t cmd, uint32_t value) {
+  uint8_t mac[6];
+  if (!parseMacString(macStr, mac)) return false;
+  if (!ensurePeer(mac)) return false;
+  SensorCmdPacket pkt = { MSG_TYPE_CMD, cmd, 0, value };
+  return esp_now_send(mac, (uint8_t*)&pkt, sizeof(pkt)) == ESP_OK;
+}
+
 void handlePacket(const uint8_t *mac, const uint8_t *data, int len, int rssi) {
   float temp = NAN;
   float hum = NAN;
   String macStr = macToString(mac);
+
+  if (len == sizeof(SensorStatusPacket)) {
+    SensorStatusPacket st;
+    memcpy(&st, data, sizeof(st));
+    if (st.type == MSG_TYPE_STATUS) {
+      int idx = findSensor(macStr);
+      if (idx != -1) {
+        sensors[idx].cfgInterval = st.interval;
+        sensors[idx].cfgRetry = st.retry;
+        sensors[idx].cfgTx = st.tx;
+        sensors[idx].cfgOta = st.ota ? true : false;
+        sensors[idx].cfgIp = st.ip;
+        sensors[idx].lastStatusMs = millis();
+      }
+      return;
+    }
+  }
+
+  if (len == sizeof(SensorAckPacket)) {
+    SensorAckPacket ack;
+    memcpy(&ack, data, sizeof(ack));
+    if (ack.type == MSG_TYPE_ACK) {
+      int idx = findSensor(macStr);
+      if (idx != -1) {
+        sensors[idx].lastAckCmd = ack.cmd;
+        sensors[idx].lastAckStatus = ack.status;
+        sensors[idx].lastAckMs = millis();
+      }
+      return;
+    }
+  }
 
   if (len == sizeof(SensorPacket)) {
     SensorPacket pkt;
@@ -530,6 +660,46 @@ void handleSetStage() {
   server.send(200, "text/plain", "OK");
 }
 
+void handleSensorCfg() {
+  if (!server.hasArg("mac")) {
+    server.send(400, "text/plain", "Missing mac");
+    return;
+  }
+  String mac = server.arg("mac");
+  bool any = false;
+
+  if (server.hasArg("interval")) {
+    uint32_t interval = (uint32_t) server.arg("interval").toInt();
+    any |= sendSensorCmd(mac, CMD_SET_INTERVAL, interval);
+  }
+  if (server.hasArg("retry")) {
+    uint32_t retry = (uint32_t) server.arg("retry").toInt();
+    any |= sendSensorCmd(mac, CMD_SET_RETRY, retry);
+  }
+  if (server.hasArg("tx")) {
+    int tx = server.arg("tx").toInt();
+    if (tx < 8) tx = 8;
+    if (tx > 78) tx = 78;
+    any |= sendSensorCmd(mac, CMD_SET_TXPOWER, (uint32_t) tx);
+  }
+  if (server.hasArg("ota")) {
+    uint32_t ota = (uint32_t) server.arg("ota").toInt();
+    any |= sendSensorCmd(mac, CMD_SET_OTA, ota ? 1 : 0);
+  }
+  if (server.hasArg("ssid")) {
+    any |= sendSensorCmdStr(mac, CMD_SET_WIFI_SSID, server.arg("ssid"));
+  }
+  if (server.hasArg("pass")) {
+    any |= sendSensorCmdStr(mac, CMD_SET_WIFI_PASS, server.arg("pass"));
+  }
+
+  if (!any) {
+    server.send(400, "text/plain", "No settings provided");
+    return;
+  }
+  server.send(200, "text/plain", "OK");
+}
+
 void handleGetSettings() {
   JsonDocument doc;
   doc["offlineMs"] = offlineAfterMs;
@@ -757,6 +927,17 @@ async function clearLogs(){
   await fetch('/clearlogs');
 }
 
+async function sendSensorCfg(mac, idx){
+  const interval = document.getElementById(`cfgInterval${idx}`).value;
+  const retry = document.getElementById(`cfgRetry${idx}`).value;
+  const tx = document.getElementById(`cfgTx${idx}`).value;
+  const ota = document.getElementById(`cfgOta${idx}`).checked ? 1 : 0;
+  const ssid = document.getElementById(`cfgSsid${idx}`).value;
+  const pass = document.getElementById(`cfgPass${idx}`).value;
+  const qs = `mac=${encodeURIComponent(mac)}&interval=${encodeURIComponent(interval)}&retry=${encodeURIComponent(retry)}&tx=${encodeURIComponent(tx)}&ota=${ota}&ssid=${encodeURIComponent(ssid)}&pass=${encodeURIComponent(pass)}`;
+  await fetch(`/sensorcfg?${qs}`);
+}
+
 function dewPointC(t, h){
   if(!isFinite(t) || !isFinite(h) || h <= 0) return NaN;
   const a = 17.62;
@@ -769,6 +950,11 @@ function fmtRssi(rssi){
   return (rssi === null || rssi === undefined || rssi <= -120) ? "--" : `${rssi} dBm`;
 }
 
+function fmtIp(ip){
+  if(!ip) return "--";
+  return [ip & 255, (ip>>8)&255, (ip>>16)&255, (ip>>24)&255].join(".");
+}
+
 function toggleSettings(){
   const el = document.getElementById('settings');
   const show = el.style.display === 'none';
@@ -779,6 +965,12 @@ function toggleSettings(){
 async function loadSettings(){
   const r = await fetch('/settings');
   const d = await r.json();
+  const r2 = await fetch('/data');
+  const d2 = await r2.json();
+  const statusByMac = {};
+  if (d2 && d2.sensors) {
+    d2.sensors.forEach(s => { statusByMac[s.mac] = s; });
+  }
   let html = '';
   html += `<div class="row"><div class="pill">Offline timeout (min)</div><input id="offlineMin" type="number" min="1" value="${Math.round(d.offlineMs/60000)}"></div>`;
   html += `<div class="row"><div class="pill">Prune discovered (min)</div><input id="pruneMin" type="number" min="1" value="${Math.round(d.pruneMs/60000)}"></div>`;
@@ -801,6 +993,22 @@ async function loadSettings(){
         <option value="Bottom sensor"${p.role==='Bottom sensor'?' selected':''}>Bottom sensor</option>
       </select></div>`;
   });
+  html += `<div class="card"><div style="font-weight:600;margin-bottom:6px;">Sensor Config</div>`;
+  d.paired.forEach((p,i)=>{
+    html += `<div class="row"><span class="muted">${p.mac}</span></div>`;
+    html += `<div class="row"><span class="muted">Interval (ms)</span><input id="cfgInterval${i}" type="number" min="1000" value="5000"></div>`;
+    html += `<div class="row"><span class="muted">DHT retries</span><input id="cfgRetry${i}" type="number" min="0" max="5" value="2"></div>`;
+    html += `<div class="row"><span class="muted">TX power (8-78)</span><input id="cfgTx${i}" type="number" min="8" max="78" value="78"></div>`;
+    html += `<div class="row"><span class="muted">OTA mode</span><input id="cfgOta${i}" type="checkbox"></div>`;
+    html += `<div class="row"><span class="muted">OTA SSID</span><input id="cfgSsid${i}" type="text" value=""></div>`;
+    const st = statusByMac[p.mac] || {};
+    const apiLine = `OTA ${st.cfgOta ? "ON" : "OFF"}, IP ${fmtIp(st.cfgIp)}, Int ${st.cfgInterval || 0}ms, Retry ${st.cfgRetry || 0}, TX ${st.cfgTx || 0}`;
+    html += `<div class="muted" style="margin-bottom:6px;">Sensor API: ${apiLine}</div>`;
+    html += `<div class="row"><span class="muted">OTA Pass</span><input id="cfgPass${i}" type="password" value=""></div>`;
+    html += `<div class="row"><button class="btn" onclick="sendSensorCfg('${p.mac}', ${i})">Apply To Sensor</button></div>`;
+  });
+  html += `</div>`;
+
   html += `</div>`;
 
   html += `<div class="row" style="margin-top:6px;">
@@ -981,6 +1189,7 @@ void setup() {
   server.on("/pair", handlePair);
   server.on("/remove", handleRemove);
   server.on("/setstage", handleSetStage);
+  server.on("/sensorcfg", handleSensorCfg);
   server.on("/settings", HTTP_GET, handleGetSettings);
   server.on("/settings", HTTP_POST, handleSetSettings);
   server.on("/clearpairing", handleClearPairing);
