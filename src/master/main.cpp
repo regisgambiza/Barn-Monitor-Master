@@ -33,6 +33,8 @@ struct Sensor {
   uint8_t cfgTx = 0;
   bool cfgOta = false;
   uint32_t cfgIp = 0;
+  uint8_t cfgSleepMode = 0;
+  uint32_t cfgSleepSec = 0;
   unsigned long lastStatusMs = 0;
 
   float tempHistory[HISTORY] = {0};
@@ -59,6 +61,8 @@ struct DiscoveredSensor {
   uint8_t cfgTx = 0;
   bool cfgOta = false;
   uint32_t cfgIp = 0;
+  uint8_t cfgSleepMode = 0;
+  uint32_t cfgSleepSec = 0;
   unsigned long lastStatusMs = 0;
 };
 
@@ -328,7 +332,11 @@ typedef struct {
   uint8_t ota;
   uint8_t retry;
   uint8_t tx;
+  uint8_t sleepMode;
+  uint8_t reserved;
+  uint16_t reserved2;
   uint32_t interval;
+  uint32_t sleepSec;
   uint32_t ip;
 } SensorStatusPacket;
 
@@ -339,6 +347,8 @@ enum {
   CMD_SET_OTA = 4,
   CMD_SET_WIFI_SSID = 5,
   CMD_SET_WIFI_PASS = 6,
+  CMD_SET_SLEEP_MODE = 7,
+  CMD_SET_SLEEP_SEC = 8,
   MSG_TYPE_CMD = 2,
   MSG_TYPE_ACK = 3,
   MSG_TYPE_STATUS = 4
@@ -399,6 +409,8 @@ void handlePacket(const uint8_t *mac, const uint8_t *data, int len, int rssi) {
         sensors[idx].cfgTx = st.tx;
         sensors[idx].cfgOta = st.ota ? true : false;
         sensors[idx].cfgIp = st.ip;
+        sensors[idx].cfgSleepMode = st.sleepMode;
+        sensors[idx].cfgSleepSec = st.sleepSec;
         sensors[idx].lastStatusMs = millis();
       }
       return;
@@ -692,6 +704,14 @@ void handleSensorCfg() {
   if (server.hasArg("pass")) {
     any |= sendSensorCmdStr(mac, CMD_SET_WIFI_PASS, server.arg("pass"));
   }
+  if (server.hasArg("sleepmode")) {
+    uint32_t sm = (uint32_t) server.arg("sleepmode").toInt();
+    any |= sendSensorCmd(mac, CMD_SET_SLEEP_MODE, sm);
+  }
+  if (server.hasArg("sleepsec")) {
+    uint32_t ss = (uint32_t) server.arg("sleepsec").toInt();
+    any |= sendSensorCmd(mac, CMD_SET_SLEEP_SEC, ss);
+  }
 
   if (!any) {
     server.send(400, "text/plain", "No settings provided");
@@ -927,6 +947,14 @@ async function clearLogs(){
   await fetch('/clearlogs');
 }
 
+function applyProfile(idx, interval, retry, tx, sleepMode, sleepSec){
+  document.getElementById(`cfgInterval${idx}`).value = interval;
+  document.getElementById(`cfgRetry${idx}`).value = retry;
+  document.getElementById(`cfgTx${idx}`).value = tx;
+  document.getElementById(`cfgSleepMode${idx}`).value = sleepMode;
+  document.getElementById(`cfgSleepSec${idx}`).value = sleepSec;
+}
+
 async function sendSensorCfg(mac, idx){
   const interval = document.getElementById(`cfgInterval${idx}`).value;
   const retry = document.getElementById(`cfgRetry${idx}`).value;
@@ -934,7 +962,9 @@ async function sendSensorCfg(mac, idx){
   const ota = document.getElementById(`cfgOta${idx}`).checked ? 1 : 0;
   const ssid = document.getElementById(`cfgSsid${idx}`).value;
   const pass = document.getElementById(`cfgPass${idx}`).value;
-  const qs = `mac=${encodeURIComponent(mac)}&interval=${encodeURIComponent(interval)}&retry=${encodeURIComponent(retry)}&tx=${encodeURIComponent(tx)}&ota=${ota}&ssid=${encodeURIComponent(ssid)}&pass=${encodeURIComponent(pass)}`;
+  const sleepmode = document.getElementById(`cfgSleepMode${idx}`).value;
+  const sleepsec = document.getElementById(`cfgSleepSec${idx}`).value;
+  const qs = `mac=${encodeURIComponent(mac)}&interval=${encodeURIComponent(interval)}&retry=${encodeURIComponent(retry)}&tx=${encodeURIComponent(tx)}&ota=${ota}&ssid=${encodeURIComponent(ssid)}&pass=${encodeURIComponent(pass)}&sleepmode=${encodeURIComponent(sleepmode)}&sleepsec=${encodeURIComponent(sleepsec)}`;
   await fetch(`/sensorcfg?${qs}`);
 }
 
@@ -1002,8 +1032,9 @@ async function loadSettings(){
     html += `<div class="row"><span class="muted">OTA mode</span><input id="cfgOta${i}" type="checkbox"></div>`;
     html += `<div class="row"><span class="muted">OTA SSID</span><input id="cfgSsid${i}" type="text" value=""></div>`;
     const st = statusByMac[p.mac] || {};
-    const apiLine = `OTA ${st.cfgOta ? "ON" : "OFF"}, IP ${fmtIp(st.cfgIp)}, Int ${st.cfgInterval || 0}ms, Retry ${st.cfgRetry || 0}, TX ${st.cfgTx || 0}`;
+    const apiLine = `OTA ${st.cfgOta ? "ON" : "OFF"}, IP ${fmtIp(st.cfgIp)}, Int ${st.cfgInterval || 0}ms, Retry ${st.cfgRetry || 0}, TX ${st.cfgTx || 0}, Sleep ${st.cfgSleepMode || 0}/${st.cfgSleepSec || 0}s`;
     html += `<div class="muted" style="margin-bottom:6px;">Sensor API: ${apiLine}</div>`;
+    html += `<div class="row" style="gap:6px;"><button class="btn" onclick="applyProfile(${i},30000,2,20,2,30)">Profile A</button><button class="btn" onclick="applyProfile(${i},60000,2,12,2,60)">Profile B</button></div>`;
     html += `<div class="row"><span class="muted">OTA Pass</span><input id="cfgPass${i}" type="password" value=""></div>`;
     html += `<div class="row"><button class="btn" onclick="sendSensorCfg('${p.mac}', ${i})">Apply To Sensor</button></div>`;
   });
