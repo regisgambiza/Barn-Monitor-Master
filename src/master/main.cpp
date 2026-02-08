@@ -95,6 +95,29 @@ unsigned long offlineAfterMs = DEFAULT_OFFLINE_AFTER_MS;
 unsigned long discoveredStaleMs = DEFAULT_DISCOVERED_STALE_MS;
 unsigned long logIntervalMs = DEFAULT_LOG_INTERVAL_MS;
 
+// Debug helpers
+static void logHeap(const char* label) {
+  Serial.printf("%s: freeHeap=%u totalHeap=%u minFreeHeap=%u\n",
+                label,
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)ESP.getHeapSize(),
+                (unsigned)ESP.getMinFreeHeap());
+}
+
+static void logWifiChannel(const char* label) {
+  uint8_t primary = 0;
+  wifi_second_chan_t secondary = WIFI_SECOND_CHAN_NONE;
+  esp_err_t res = esp_wifi_get_channel(&primary, &secondary);
+  Serial.print(label);
+  Serial.print(": ");
+  if (res == ESP_OK) {
+    Serial.printf("channel primary=%u secondary=%d\n",
+                  (unsigned)primary, (int)secondary);
+  } else {
+    Serial.printf("channel query failed (err=%d)\n", (int)res);
+  }
+}
+
 // ---------------- MAC STRING ----------------
 String macToString(const uint8_t *mac) {
   char buf[18];
@@ -123,6 +146,7 @@ void upsertDiscovered(const String& mac, float temp, float hum, float batt, floa
     if (discoveredCount >= MAX_DISCOVERED) return;
     idx = discoveredCount++;
     discovered[idx].mac = mac;
+    Serial.printf("Discovered new sensor: %s (count=%d)\n", mac.c_str(), discoveredCount);
   }
   discovered[idx].temp = temp;
   discovered[idx].hum = hum;
@@ -412,6 +436,7 @@ void handlePacket(const uint8_t *mac, const uint8_t *data, int len, int rssi) {
   float batt = NAN;
   float adc = NAN;
   String macStr = macToString(mac);
+  Serial.printf("RX: len=%d rssi=%d from=%s\n", len, rssi, macStr.c_str());
 
   if (len == sizeof(SensorStatusPacket)) {
     SensorStatusPacket st;
@@ -451,6 +476,7 @@ void handlePacket(const uint8_t *mac, const uint8_t *data, int len, int rssi) {
     memcpy(&pkt, data, sizeof(pkt));
     temp = pkt.temp;
     hum = pkt.hum;
+    Serial.printf("RX: SensorPacket temp=%.2f hum=%.2f\n", temp, hum);
   } else if (len == sizeof(SensorPacketV2)) {
     SensorPacketV2 pkt;
     memcpy(&pkt, data, sizeof(pkt));
@@ -458,19 +484,24 @@ void handlePacket(const uint8_t *mac, const uint8_t *data, int len, int rssi) {
     hum = pkt.hum;
     batt = pkt.batt;
     adc = pkt.adc;
+    Serial.printf("RX: SensorPacketV2 temp=%.2f hum=%.2f batt=%.2f adc=%.2f\n", temp, hum, batt, adc);
   } else if (len == sizeof(SensorPacketWithMac)) {
     SensorPacketWithMac pkt;
     memcpy(&pkt, data, sizeof(pkt));
     temp = pkt.temp;
     hum = pkt.hum;
     macStr = macToString(pkt.mac);
+    Serial.printf("RX: PacketWithMac temp=%.2f hum=%.2f mac=%s\n", temp, hum, macStr.c_str());
   } else {
+    Serial.println("RX: Unknown packet size, ignored");
     return;
   }
 
   bool valid = isReadingValid(temp, hum);
   int idx = findSensor(macStr);
   if (idx == -1) {
+    Serial.printf("RX: unpaired sensor %s (valid=%s)\n",
+                  macStr.c_str(), valid ? "true" : "false");
     if (valid) upsertDiscovered(macStr, temp, hum, batt, adc, rssi);
     else upsertDiscovered(macStr, NAN, NAN, batt, adc, rssi);
     return;
@@ -494,7 +525,8 @@ void handlePacket(const uint8_t *mac, const uint8_t *data, int len, int rssi) {
 
   updateAlarm(sensors[idx]);
 
-  Serial.println("Sensor updated");
+  Serial.printf("RX: sensor updated idx=%d temp=%.2f hum=%.2f\n",
+                idx, sensors[idx].temp, sensors[idx].hum);
 }
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
@@ -537,6 +569,7 @@ void logData() {
 
 // ---------------- JSON DATA ----------------
 void handleData() {
+  Serial.printf("HTTP /data: sensors=%d discovered=%d\n", sensorCount, discoveredCount);
   JsonDocument doc;
   doc["stage"] = stages[activeStage].name;
   doc["stageIndex"] = activeStage;
@@ -607,6 +640,7 @@ void handleSetZone() {
   }
   String mac = server.arg("mac");
   String name = normalizeRole(server.arg("name"));
+  Serial.printf("HTTP /setzone: mac=%s name=%s\n", mac.c_str(), name.c_str());
   if (name.length() == 0) {
     server.send(400, "text/plain", "Invalid role");
     return;
@@ -632,6 +666,7 @@ void handlePair() {
   }
   String mac = server.arg("mac");
   String role = normalizeRole(server.arg("role"));
+  Serial.printf("HTTP /pair: mac=%s role=%s\n", mac.c_str(), role.c_str());
   if (role.length() == 0) {
     server.send(400, "text/plain", "Invalid role");
     return;
@@ -644,11 +679,13 @@ void handlePair() {
   int idx = findSensor(mac);
   if (idx == -1) {
     if (sensorCount >= MAX_SENSORS) {
+      Serial.println("HTTP /pair: max sensors reached");
       server.send(400, "text/plain", "Max sensors reached");
       return;
     }
     idx = sensorCount++;
     sensors[idx].mac = mac;
+    Serial.printf("HTTP /pair: added sensor idx=%d\n", idx);
   }
 
   sensors[idx].zone = role;
@@ -1005,7 +1042,9 @@ function dewPointC(t, h){
 }
 
 function fmtRssi(rssi){
-  return (rssi === null || rssi === undefined || rssi <= -120) ? "--" : `${rssi} dBm`;
+  if (rssi === null || rssi === undefined) return "--";
+  if (rssi <= -120) return "N/A";
+  return `${rssi} dBm`;
 }
 
 function fmtIp(ip){
@@ -1014,11 +1053,18 @@ function fmtIp(ip){
 }
 
 function battPercent(v){
-  if(!isFinite(v)) return "--";
+  const n = Number(v);
+  if(!Number.isFinite(n)) return "--";
   const minV = 3.0;
   const maxV = 4.2;
-  const pct = Math.round((v - minV) / (maxV - minV) * 100);
+  const pct = Math.round((n - minV) / (maxV - minV) * 100);
   return Math.max(0, Math.min(100, pct));
+}
+
+function fmtNum(val, digits){
+  const n = Number(val);
+  if(!Number.isFinite(n)) return "--";
+  return n.toFixed(digits);
 }
 
 function toggleSettings(){
@@ -1170,12 +1216,12 @@ async function loadData(){
         <div class="title">${s.alarmReason || 'Out of range'}</div>
         <div class="body">${s.alarmSolution || ''}</div>
       </div>` : ``}
-      <div>Temp: ${s.temp.toFixed(1)} &deg;C</div>
+      <div>Temp: ${fmtNum(s.temp,1)} &deg;C</div>
       <div class="gauge"><span style="width:${clampPct(s.temp,d.tMin,d.tMax)}%"></span></div>
-      <div>Hum: ${s.hum.toFixed(1)} %</div>
+      <div>Hum: ${fmtNum(s.hum,1)} %</div>
       <div class="gauge"><span style="width:${clampPct(s.hum,d.hMin,d.hMax)}%"></span></div>
-      <div>Battery: ${isFinite(s.batt) ? s.batt.toFixed(2) : '--'} V (${battPercent(s.batt)}%) (ADC ${isFinite(s.adc) ? s.adc.toFixed(0) : '--'})</div>
-      <div>Dew point: ${currentDew.toFixed(1)} &deg;C</div>
+      <div>Battery: ${fmtNum(s.batt,2)} V (${battPercent(s.batt)}%) (ADC ${fmtNum(s.adc,0)})</div>
+      <div>Dew point: ${fmtNum(currentDew,1)} &deg;C</div>
       <div class="row" style="margin-top:8px;">
         <div class="muted">Last update: ${s.lastUpdate}s ago</div>
         <button class="btn warn" onclick="removeSensor('${s.mac}')">Remove</button>
@@ -1195,11 +1241,11 @@ async function loadData(){
     d.available.forEach((a,i)=>{
       availHtml += `
       <div class="card">
-        <div class="row">
-          <div style="font-weight:600;">Sensor ${i+1}</div>
-          <div class="muted">Seen ${a.lastSeen}s ago</div>
-        </div>
-        <div class="muted">Temp ${a.temp.toFixed(1)} &deg;C, Hum ${a.hum.toFixed(1)} %, Batt ${isFinite(a.batt)?a.batt.toFixed(2):'--'} V (${battPercent(a.batt)}%) (ADC ${isFinite(a.adc)?a.adc.toFixed(0):'--'}), RSSI ${fmtRssi(a.rssi)}</div>
+      <div class="row">
+        <div style="font-weight:600;">Sensor ${i+1}</div>
+        <div class="muted">Seen ${a.lastSeen}s ago</div>
+      </div>
+        <div class="muted">Temp ${fmtNum(a.temp,1)} &deg;C, Hum ${fmtNum(a.hum,1)} %, Batt ${fmtNum(a.batt,2)} V (${battPercent(a.batt)}%) (ADC ${fmtNum(a.adc,0)}), RSSI ${fmtRssi(a.rssi)}</div>
         <div class="role-btns" style="margin-top:8px;">
           <button class="btn" onclick="pairSensor('${a.mac}','top')">Top</button>
           <button class="btn" onclick="pairSensor('${a.mac}','middle')">Middle</button>
@@ -1225,6 +1271,8 @@ loadData();
 void setup() {
 
   Serial.begin(115200);
+  delay(300);
+  Serial.println("Boot: master");
 
   if (!SPIFFS.begin(true)) {
     Serial.println("SPIFFS mount failed");
@@ -1235,21 +1283,29 @@ void setup() {
   loadSettings();
 
   WiFiManager wm;
+  Serial.println("WiFi: starting WiFiManager");
   wm.autoConnect("BarnMonitor-Setup");
+  Serial.print("WiFi: connected, IP=");
+  Serial.println(WiFi.localIP());
+  logWifiChannel("WiFi");
+  logHeap("Heap after WiFi");
 
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
-  Serial.print("Connected IP: ");
-  Serial.println(WiFi.localIP());
-
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  Serial.println("WiFi: STA mode, sleep disabled");
+  logWifiChannel("WiFi after STA");
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP NOW FAIL");
     return;
   }
+  Serial.println("ESP-NOW init OK");
 
   esp_now_register_recv_cb(onReceive);
+  Serial.println("ESP-NOW recv callback registered");
+  logHeap("Heap after ESP-NOW");
 
   server.on("/", handleRoot);
   server.on("/data", handleData);
