@@ -15,22 +15,13 @@ typedef struct {
   float hum;
 } SensorPacket;
 
-typedef struct {
-  float temp;
-  float hum;
-  float batt;
-  float adc;
-} SensorPacketV2;
-
 static const uint8_t kBroadcastMac[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 static const uint32_t kSendIntervalMs = 1000;
 static const uint8_t kSdaPin = 8;
 static const uint8_t kSclPin = 9;
 static const uint8_t kShtAddr = 0x44;
-static const int kAdcPin = 2;
-static const float kBatteryMultiplier = 1.48f;
 
-SensorPacketV2 pkt;
+SensorPacket pkt;
 unsigned long lastSend = 0;
 float lastTemp = 22.0f;
 float lastHum = 55.0f;
@@ -59,9 +50,6 @@ void setup() {
     Serial.println("SHT30 OK");
   }
 
-  analogReadResolution(12);
-  analogSetPinAttenuation(kAdcPin, ADC_11db);
-
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW init failed");
     return;
@@ -81,15 +69,6 @@ void loop() {
   if (now - lastSend < kSendIntervalMs) return;
   lastSend = now;
 
-  uint32_t sum = 0;
-  for (int i = 0; i < 20; i++) {
-    sum += analogRead(kAdcPin);
-    delay(3);
-  }
-  float adc = sum / 20.0f;
-  float adcVoltage = (adc / 4095.0f) * 3.3f;
-  float vbat = adcVoltage * kBatteryMultiplier;
-
   float t = sht31.readTemperature();
   float h = sht31.readHumidity();
   if (isfinite(t) && isfinite(h)) {
@@ -99,9 +78,7 @@ void loop() {
 
   pkt.temp = lastTemp;
   pkt.hum  = lastHum;
-  pkt.batt = vbat;
-  pkt.adc  = adc;
 
   esp_now_send(kBroadcastMac, (uint8_t*)&pkt, sizeof(pkt));
-  Serial.printf("Sent temp=%.2fC hum=%.2f%% batt=%.2fV\n", pkt.temp, pkt.hum, pkt.batt);
+  Serial.printf("Sent temp=%.2fC hum=%.2f%%\n", pkt.temp, pkt.hum);
 }
