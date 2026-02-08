@@ -22,6 +22,8 @@ struct Sensor {
   String zone;
   float temp = NAN;
   float hum = NAN;
+  float batt = NAN;
+  float adc = NAN;
   unsigned long lastUpdate = 0;
   uint32_t packetCount = 0;
   int rssi = -127;
@@ -51,6 +53,8 @@ struct DiscoveredSensor {
   String mac;
   float temp = NAN;
   float hum = NAN;
+  float batt = NAN;
+  float adc = NAN;
   unsigned long lastSeen = 0;
   int rssi = -127;
   uint8_t lastAckCmd = 0;
@@ -113,7 +117,7 @@ int findDiscovered(const String& mac) {
   return -1;
 }
 
-void upsertDiscovered(const String& mac, float temp, float hum, int rssi) {
+void upsertDiscovered(const String& mac, float temp, float hum, float batt, float adc, int rssi) {
   int idx = findDiscovered(mac);
   if (idx == -1) {
     if (discoveredCount >= MAX_DISCOVERED) return;
@@ -122,6 +126,8 @@ void upsertDiscovered(const String& mac, float temp, float hum, int rssi) {
   }
   discovered[idx].temp = temp;
   discovered[idx].hum = hum;
+  discovered[idx].batt = batt;
+  discovered[idx].adc = adc;
   discovered[idx].rssi = rssi;
   discovered[idx].lastSeen = millis();
 }
@@ -301,6 +307,13 @@ typedef struct {
 } SensorPacket;
 
 typedef struct {
+  float temp;
+  float hum;
+  float batt;
+  float adc;
+} SensorPacketV2;
+
+typedef struct {
   uint8_t mac[6];
   float temp;
   float hum;
@@ -396,6 +409,8 @@ bool sendSensorCmd(const String& macStr, uint8_t cmd, uint32_t value) {
 void handlePacket(const uint8_t *mac, const uint8_t *data, int len, int rssi) {
   float temp = NAN;
   float hum = NAN;
+  float batt = NAN;
+  float adc = NAN;
   String macStr = macToString(mac);
 
   if (len == sizeof(SensorStatusPacket)) {
@@ -436,6 +451,13 @@ void handlePacket(const uint8_t *mac, const uint8_t *data, int len, int rssi) {
     memcpy(&pkt, data, sizeof(pkt));
     temp = pkt.temp;
     hum = pkt.hum;
+  } else if (len == sizeof(SensorPacketV2)) {
+    SensorPacketV2 pkt;
+    memcpy(&pkt, data, sizeof(pkt));
+    temp = pkt.temp;
+    hum = pkt.hum;
+    batt = pkt.batt;
+    adc = pkt.adc;
   } else if (len == sizeof(SensorPacketWithMac)) {
     SensorPacketWithMac pkt;
     memcpy(&pkt, data, sizeof(pkt));
@@ -449,8 +471,8 @@ void handlePacket(const uint8_t *mac, const uint8_t *data, int len, int rssi) {
   bool valid = isReadingValid(temp, hum);
   int idx = findSensor(macStr);
   if (idx == -1) {
-    if (valid) upsertDiscovered(macStr, temp, hum, rssi);
-    else upsertDiscovered(macStr, NAN, NAN, rssi);
+    if (valid) upsertDiscovered(macStr, temp, hum, batt, adc, rssi);
+    else upsertDiscovered(macStr, NAN, NAN, batt, adc, rssi);
     return;
   }
 
@@ -462,6 +484,8 @@ void handlePacket(const uint8_t *mac, const uint8_t *data, int len, int rssi) {
 
   sensors[idx].temp = temp;
   sensors[idx].hum = hum;
+  if (isfinite(batt)) sensors[idx].batt = batt;
+  if (isfinite(adc)) sensors[idx].adc = adc;
 
   int h = sensors[idx].historyIndex;
   sensors[idx].tempHistory[h] = temp;
@@ -529,6 +553,8 @@ void handleData() {
     s["zone"] = sensors[i].zone;
     s["temp"] = sensors[i].temp;
     s["hum"] = sensors[i].hum;
+    s["batt"] = sensors[i].batt;
+    s["adc"] = sensors[i].adc;
     s["alarm"] = sensors[i].alarmActive;
     s["lastUpdate"] = sensors[i].lastUpdate ? (millis() - sensors[i].lastUpdate) / 1000 : 0;
     s["offline"] = sensors[i].lastUpdate ? ((millis() - sensors[i].lastUpdate) > offlineAfterMs) : true;
@@ -562,6 +588,8 @@ void handleData() {
     d["mac"] = discovered[i].mac;
     d["temp"] = discovered[i].temp;
     d["hum"] = discovered[i].hum;
+    d["batt"] = discovered[i].batt;
+    d["adc"] = discovered[i].adc;
     d["rssi"] = discovered[i].rssi;
     d["lastSeen"] = (millis() - discovered[i].lastSeen) / 1000;
     i++;
@@ -985,6 +1013,14 @@ function fmtIp(ip){
   return [ip & 255, (ip>>8)&255, (ip>>16)&255, (ip>>24)&255].join(".");
 }
 
+function battPercent(v){
+  if(!isFinite(v)) return "--";
+  const minV = 3.0;
+  const maxV = 4.2;
+  const pct = Math.round((v - minV) / (maxV - minV) * 100);
+  return Math.max(0, Math.min(100, pct));
+}
+
 function toggleSettings(){
   const el = document.getElementById('settings');
   const show = el.style.display === 'none';
@@ -1138,6 +1174,7 @@ async function loadData(){
       <div class="gauge"><span style="width:${clampPct(s.temp,d.tMin,d.tMax)}%"></span></div>
       <div>Hum: ${s.hum.toFixed(1)} %</div>
       <div class="gauge"><span style="width:${clampPct(s.hum,d.hMin,d.hMax)}%"></span></div>
+      <div>Battery: ${isFinite(s.batt) ? s.batt.toFixed(2) : '--'} V (${battPercent(s.batt)}%) (ADC ${isFinite(s.adc) ? s.adc.toFixed(0) : '--'})</div>
       <div>Dew point: ${currentDew.toFixed(1)} &deg;C</div>
       <div class="row" style="margin-top:8px;">
         <div class="muted">Last update: ${s.lastUpdate}s ago</div>
@@ -1162,7 +1199,7 @@ async function loadData(){
           <div style="font-weight:600;">Sensor ${i+1}</div>
           <div class="muted">Seen ${a.lastSeen}s ago</div>
         </div>
-        <div class="muted">Temp ${a.temp.toFixed(1)} &deg;C, Hum ${a.hum.toFixed(1)} %, RSSI ${fmtRssi(a.rssi)}</div>
+        <div class="muted">Temp ${a.temp.toFixed(1)} &deg;C, Hum ${a.hum.toFixed(1)} %, Batt ${isFinite(a.batt)?a.batt.toFixed(2):'--'} V (${battPercent(a.batt)}%) (ADC ${isFinite(a.adc)?a.adc.toFixed(0):'--'}), RSSI ${fmtRssi(a.rssi)}</div>
         <div class="role-btns" style="margin-top:8px;">
           <button class="btn" onclick="pairSensor('${a.mac}','top')">Top</button>
           <button class="btn" onclick="pairSensor('${a.mac}','middle')">Middle</button>
